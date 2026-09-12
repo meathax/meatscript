@@ -27,7 +27,7 @@ import zipfile, zlib, subprocess, select, queue
 import xml.etree.ElementTree as ET
 
 # Increment for each published script release. Development modes never self-update.
-SCRIPT_VERSION = 2026091204
+SCRIPT_VERSION = 2026091205
 SELF_TREE_URL = 'https://api.github.com/repos/meathax/meatscript/git/trees/main'
 SELF_RAW_URL = 'https://raw.githubusercontent.com/meathax/meatscript/main/MEATCORES.sh'
 
@@ -128,8 +128,8 @@ def url_for(db, path):
         raise ValueError('Database download URL must use HTTPS')
     return url
 
-def request(url):
-    return urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'MEATCORES/1.0'}), timeout=20)
+def request(url, method=None):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'MEATCORES/1.0'}, method=method), timeout=20)
 
 def parse_db(data):
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -329,7 +329,6 @@ def extract_disk(dest, meta, stage, cancel, progress):
     # removes the downloaded CHD, helper and partial outputs on all exit paths.
 
 ROM_ITEM = 'https://archive.org/download/mame-roms-merged_/'
-ROM_METADATA = 'https://archive.org/metadata/mame-roms-merged_'
 
 class RomSearch(list):
     def __init__(self, names, crcs):
@@ -370,30 +369,38 @@ def rom_present(root, folder, names):
     return names.crcs <= available
 
 def resolve_roms(library, progress, cancel):
-    pending = [(g, names) for i in library.selected if library.eligible(i)
-               for g in [library.games[i]] for names in g.get('rom_groups', [])
-               if not rom_present(library.root, library.rom_folder, names)]
-    if not pending: return
-    progress('READING ROM DOWNLOAD INDEX', 0)
-    if cancel.is_set(): raise Cancelled()
-    with request(ROM_METADATA) as response:
-        raw = response.read(32*1024*1024+1)
-    if len(raw)>32*1024*1024: raise RuntimeError('ROM index too large')
-    lookup = {pathlib.PurePosixPath(f['name']).name:f for f in json.loads(raw)['files']
-              if f.get('name','').startswith('MAME ROMs (merged)/')
-              and f['name'].endswith('.zip') and not f.get('private')}
-    for g,names in pending:
-        if cancel.is_set(): raise Cancelled()
-        available = [name for name in names if name in lookup]
-        if not available: raise RuntimeError('ROM unavailable in Archive: '+'|'.join(names))
-        for name in available:
-            target = library.rom_folder+'/'+name
-            if safe_path(library.root,target).is_file(): continue
-            entry = lookup[name]
-            library.db['files'][target] = {'size':int(entry['size']),'hash':entry['md5'].zfill(32),
-                'url':ROM_ITEM+urllib.parse.quote(entry['name'],safe='/'),'rom':True,'overwrite':False}
-            library.states[target]='NEW'
-            if target not in g['files']: g['files'].append(target)
+    checked = {}
+    for i in library.selected:
+        if not library.eligible(i): continue
+        g = library.games[i]
+        for names in g.get('rom_groups', []):
+            if rom_present(library.root, library.rom_folder, names): continue
+            available = False
+            for name in names:
+                if cancel.is_set(): raise Cancelled()
+                target = library.rom_folder+'/'+name
+                if safe_path(library.root, target).is_file():
+                    available = True
+                    continue
+                if name not in checked:
+                    progress('CHECKING ROM '+name, 0)
+                    url = ROM_ITEM+urllib.parse.quote('MAME ROMs (merged)/'+name, safe='/')
+                    try:
+                        with request(url, method='HEAD') as response:
+                            size = int(response.headers.get('Content-Length', '0'))
+                        if size <= 0: raise RuntimeError('ROM size unavailable: '+name)
+                        checked[name] = {'size':size, 'url':url, 'rom':True, 'overwrite':False}
+                    except urllib.error.HTTPError as exc:
+                        exc.close()
+                        if exc.code != 404: raise
+                        checked[name] = None
+                meta = checked[name]
+                if meta is None: continue
+                available = True
+                library.db['files'][target] = meta
+                library.states[target] = 'NEW'
+                if target not in g['files']: g['files'].append(target)
+            if not available: raise RuntimeError('ROM unavailable in Archive: '+'|'.join(names))
 
 def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
     # Cache MRA descriptions by DB hash; never trust an obsolete local MRA.
@@ -585,8 +592,8 @@ def install(library, cancel, progress):
                                      (completed + got) / max(total, 1))
                         output.flush()
                         os.fsync(output.fileno())
-                    if not verified(dest, meta):
-                        raise RuntimeError('Size/MD5 verification failed: ' + p)
+                    if (dest.stat().st_size != meta['size'] if meta.get('rom') else not verified(dest, meta)):
+                        raise RuntimeError('Download verification failed: ' + p)
                     if meta.get('rom'):
                         with zipfile.ZipFile(dest) as rom_zip:
                             if rom_zip.testzip() is not None:
@@ -606,6 +613,21 @@ def install(library, cancel, progress):
             completed += meta['size']
         if cancel.is_set():
             raise Cancelled()
+        # Check required MRA CRCs across staged ZIPs and existing parent/clone ZIPs.
+        for i in library.selected:
+            for names in library.games[i].get('rom_groups', []):
+                required = getattr(names, 'crcs', set())
+                if not required: continue
+                found = set()
+                for name in names:
+                    relative = library.rom_folder+'/'+name
+                    candidate = safe_path(stage, relative)
+                    if not candidate.is_file(): candidate = safe_path(library.root, relative)
+                    if candidate.is_file():
+                        with zipfile.ZipFile(candidate) as archive:
+                            found.update(entry.CRC for entry in archive.infolist())
+                if not required.issubset(found):
+                    raise RuntimeError('Required ROM CRCs missing: '+'|'.join(names))
         # Journal backups allow rollback on a filesystem error. Do not remove old RBFs.
         journal = []
         try:
