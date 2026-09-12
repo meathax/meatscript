@@ -26,6 +26,65 @@ import struct, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.req
 import zipfile, zlib, subprocess, select
 import xml.etree.ElementTree as ET
 
+# Increment for each published script release. Development modes never self-update.
+SCRIPT_VERSION = 2026091201
+SELF_TREE_URL = 'https://api.github.com/repos/meathax/meatscript/git/trees/main'
+SELF_RAW_URL = 'https://raw.githubusercontent.com/meathax/meatscript/main/MEATCORES.sh'
+
+def self_update():
+    target = pathlib.Path(os.environ.get('MEATCORES_SELF', '')).resolve()
+    if os.environ.pop('MEATCORES_UPDATED', '') == str(target): return
+    temporary = None
+    try:
+        current = target.read_bytes()
+        def blob_hash(data):
+            return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+        def get(url):
+            return urllib.request.urlopen(urllib.request.Request(url, headers={
+                'User-Agent': 'MEATCORES', 'Accept': 'application/vnd.github+json'}), timeout=2)
+        with get(SELF_TREE_URL) as response:
+            raw = response.read(65537)
+        if len(raw) > 65536: return
+        entry = next((e for e in json.loads(raw).get('tree', [])
+                      if e.get('path') == 'MEATCORES.sh' and e.get('type') == 'blob'), None)
+        if not entry or entry['sha'] == blob_hash(current): return
+        size = entry.get('size', 0)
+        if not 0 < size <= 8*1024*1024: return
+        data, deadline = bytearray(), time.monotonic()+6
+        with get(SELF_RAW_URL) as response:
+            while len(data) <= size:
+                if time.monotonic() > deadline: return
+                block = response.read(min(65536, size+1-len(data)))
+                if not block: break
+                data.extend(block)
+        data = bytes(data)
+        if len(data) != size or blob_hash(data) != entry['sha']: return
+        match = re.search(rb'^SCRIPT_VERSION = ([0-9]+)$', data, re.M)
+        if not match or int(match[1]) <= SCRIPT_VERSION: return
+        if not data.startswith(b'#!/bin/bash\n'): return
+        payload = data.split(b"<<'MEATCORES_PY'\n", 1)[1].rsplit(b'\nMEATCORES_PY', 1)[0]
+        compile(payload, str(target), 'exec')
+        fd, name = tempfile.mkstemp(prefix='.MEATCORES-update-', dir=target.parent)
+        temporary = pathlib.Path(name)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data); out.flush(); os.fsync(out.fileno())
+        temporary.chmod(target.stat().st_mode & 0o777 | 0o100)
+        check = subprocess.run(['/bin/bash','-n',str(temporary)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=2)
+        if check.returncode: return
+        os.replace(temporary, target)
+        temporary = None
+        env = dict(os.environ, MEATCORES_UPDATED=str(target))
+        os.execve('/bin/bash', ['/bin/bash',str(target)]+sys.argv[1:], env)
+    except Exception:
+        # Network, validation or read-only media failures must never block launch.
+        pass
+    finally:
+        if temporary is not None:
+            try: temporary.unlink()
+            except OSError: pass
+
+
 DB_URL = 'https://raw.githubusercontent.com/meathax/meatcores/db/db.json.zip'
 ROOT = pathlib.Path('/media/fat')
 SYSTEMS = {'Bucky': "Bucky O'Hare", 'DoCastle': 'Universal Do! Series',
@@ -942,6 +1001,8 @@ def main():
     parser.add_argument('--extract-display-source',type=pathlib.Path,help='Extract embedded FPGA source and license notices')
     args=parser.parse_args()
     args.root=args.root.resolve()
+    if not (args.catalog or args.preview or args.db or args.extract_display_source):
+        self_update()
     if args.extract_display_source:
         target=args.extract_display_source.resolve()
         source=pathlib.Path(os.environ['MEATCORES_SELF']).read_bytes()
