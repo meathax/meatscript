@@ -24,6 +24,7 @@ import argparse, base64, collections, concurrent.futures, ctypes, fcntl
 import hashlib, io, json, mmap, os, pathlib, re, shutil, signal
 import struct, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request
 import zipfile, zlib
+import xml.etree.ElementTree as ET
 
 DB_URL = 'https://raw.githubusercontent.com/meathax/meatcores/db/db.json.zip'
 ROOT = pathlib.Path('/media/fat')
@@ -122,6 +123,78 @@ def core_date(path):
     match = re.search(r'_(\d{8})\.rbf$', path, re.I)
     return match.group(1) if match else ''
 
+# Future CHD support: user-selected sources (not downloaded by this version).
+# https://archive.org/download/mame-chd-collection_01
+# https://archive.org/download/mame-chd-collection_02
+ROM_ITEM = 'https://archive.org/download/mame-roms-merged_/'
+ROM_METADATA = 'https://archive.org/metadata/mame-roms-merged_'
+
+def rom_names(data):
+    tree = ET.fromstring(data)
+    result = []
+    for rom in tree.iter('rom'):
+        names = []
+        for name in rom.get('zip', '').split('|'):
+            name = name.strip()
+            if not name: continue
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+\.zip', name) or '..' in name:
+                raise ValueError('Unsafe MRA ROM filename: ' + name)
+            names.append(name)
+        if names: result.append(names)
+    return result
+
+def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
+    # Cache MRA descriptions by DB hash; never trust an obsolete local MRA.
+    cache.mkdir(parents=True, exist_ok=True)
+    mras = sorted({p for g in library.games for p in g['files'] if p.lower().endswith('.mra')})
+    def read_mra(p):
+        if cancel is not None and cancel.is_set(): raise Cancelled()
+        meta = library.db['files'][p]
+        local = safe_path(library.root, p)
+        cached = cache / (meta['hash'] + '.mra')
+        source = local if verified(local, meta, cancel) else cached
+        if not verified(source, meta, cancel):
+            with request(url_for(library.db, p)) as response:
+                data = response.read(meta['size'] + 1)
+            if len(data) != meta['size'] or hashlib.md5(data).hexdigest() != meta['hash']:
+                raise RuntimeError('MRA verification failed: ' + p)
+            cached.write_bytes(data)
+            source = cached
+        return p, rom_names(source.read_bytes())
+    progress('CHECKING ROM REQUIREMENTS')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        requirements = dict(pool.map(read_mra, mras))
+    # FAT is case insensitive; preserve the existing spelling for other filesystems.
+    folder = 'games/MAME' if (library.root/'games/MAME').is_dir() else 'games/mame'
+    lookup = None
+    for g in library.games:
+        g['rom_error'] = ''
+        for p in list(g['files']):
+            for names in requirements.get(p, []):
+                existing = [name for name in names if safe_path(library.root, folder+'/'+name).is_file()]
+                if len(existing) == len(names): continue
+                if lookup is None:
+                    progress('READING ARCHIVE ROM INDEX')
+                    with request(ROM_METADATA) as response:
+                        raw = response.read(32 * 1024 * 1024 + 1)
+                    if len(raw) > 32 * 1024 * 1024: raise RuntimeError('ROM index too large')
+                    lookup = {pathlib.PurePosixPath(f['name']).name: f for f in json.loads(raw)['files']
+                              if f.get('name', '').startswith('MAME ROMs (merged)/')
+                              and f['name'].endswith('.zip') and not f.get('private')}
+                available = [name for name in names if name in lookup]
+                # Merged archives store clones inside their parent ZIP.
+                if not available and not existing:
+                    g['rom_error'] = 'ROM unavailable in Archive: ' + '|'.join(names)
+                for name in available:
+                    target = folder+'/'+name
+                    if safe_path(library.root, target).is_file(): continue
+                    entry = lookup[name]
+                    meta = {'size': int(entry['size']), 'hash': entry['md5'].zfill(32),
+                            'url': ROM_ITEM + urllib.parse.quote(entry['name'], safe='/'),
+                            'rom': True, 'overwrite': False}
+                    library.db['files'][target] = meta
+                    if target not in g['files']: g['files'].append(target)
+
 class Library:
     def __init__(self, db, root):
         self.db, self.root = db, root
@@ -165,7 +238,7 @@ class Library:
             progress('VERIFYING FILES %d/%d' % (n + 1, len(paths)))
             target = safe_path(self.root, p)
             meta = self.db['files'][p]
-            state = 'CURRENT' if verified(target, meta, cancel) else ('REPAIR' if target.exists() else 'NEW')
+            state = 'CURRENT' if (target.is_file() if meta.get('rom') else verified(target, meta, cancel)) else ('REPAIR' if target.exists() else 'NEW')
             if p.lower().endswith('.rbf'):
                 date = core_date(p)
                 if target.parent not in version_index:
@@ -185,7 +258,7 @@ class Library:
             g['installed'] = safe_path(self.root, g['mra']).is_file()
             if 'LOCAL NEWER' in current:
                 g['state'] = 'LOCAL NEWER'
-            elif all(s == 'CURRENT' for s in current):
+            elif all(s == 'CURRENT' for s in current) and not g.get('rom_error'):
                 g['state'] = 'CURRENT'
             elif 'UPDATE' in current and g['installed']:
                 g['state'] = 'UPDATE'
@@ -222,7 +295,11 @@ class Cancelled(Exception):
     pass
 
 def install(library, cancel, progress):
-    paths = library.plan()
+    for i in library.selected:
+        if library.games[i].get('rom_error'):
+            raise RuntimeError(library.games[i]['rom_error'])
+    paths = [p for p in library.plan()
+             if not (library.db['files'][p].get('rom') and safe_path(library.root, p).is_file())]
     if not paths:
         return 0
     total = sum(library.db['files'][p]['size'] for p in paths)
@@ -260,6 +337,10 @@ def install(library, cancel, progress):
                         os.fsync(output.fileno())
                     if not verified(dest, meta):
                         raise RuntimeError('Size/MD5 verification failed: ' + p)
+                    if meta.get('rom'):
+                        with zipfile.ZipFile(dest) as rom_zip:
+                            if rom_zip.testzip() is not None:
+                                raise RuntimeError('ROM ZIP integrity check failed: ' + p)
                     error = None
                     break
                 except Cancelled:
@@ -279,7 +360,7 @@ def install(library, cancel, progress):
             for index, p in enumerate(paths):
                 dest = safe_path(library.root, p)
                 meta = library.db['files'][p]
-                if verified(dest, meta):
+                if (dest.is_file() if meta.get('rom') else verified(dest, meta)):
                     continue
                 if dest.exists() and not meta.get('overwrite', True):
                     raise RuntimeError('Database protects existing file: ' + p)
@@ -645,6 +726,7 @@ def run_ui(root):
     def startup():
         db,online,message=load_db(cache)
         lib=Library(db,root)
+        if online: prepare_roms(lib,cache/'mras',ui.progress,cancel)
         lib.scan(ui.progress,cancel)
         return lib,online,message
     try:
