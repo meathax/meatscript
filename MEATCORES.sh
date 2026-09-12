@@ -9,6 +9,8 @@
 # Systems and standalone games are ordered by newest RBF release date first.
 # Downloads are size/MD5 verified, staged, then placed at the exact DB paths.
 # The current DB contains MRAs and RBFs, not MAME ROM archives.
+# Menu music: “Blue Space” by FoxSynergy (CC-BY 3.0), OpenGameArt.org.
+# Source page: https://opengameart.org/content/blue-space
 # Exit restores menu.rbf. No MiSTer.ini changes or background service are installed.
 # Display hardware source and its license notices are embedded in this same file:
 #     bash MEATCORES.sh --extract-display-source ./meatcores-display-source
@@ -27,7 +29,7 @@ import zipfile, zlib, subprocess, select, queue
 import xml.etree.ElementTree as ET
 
 # Increment for each published script release. Development modes never self-update.
-SCRIPT_VERSION = 2026091205
+SCRIPT_VERSION = 2026091301
 SELF_TREE_URL = 'https://api.github.com/repos/meathax/meatscript/git/trees/main'
 SELF_RAW_URL = 'https://raw.githubusercontent.com/meathax/meatscript/main/MEATCORES.sh'
 
@@ -329,6 +331,112 @@ def extract_disk(dest, meta, stage, cancel, progress):
     # removes the downloaded CHD, helper and partial outputs on all exit paths.
 
 ROM_ITEM = 'https://archive.org/download/mame-roms-merged_/'
+
+# A compact 32 kbps Amiga-like loop (about 3 minutes). Keeping the
+# source URL and digest here lets the launcher ship as one script while still
+# refusing altered or incomplete audio. The file is cached beside the launcher.
+MUSIC_URL = ('https://opengameart.org/sites/default/files/'
+             'Blue%20Space%20v0_8%20%2832%20kbps%29.mp3')
+MUSIC_SHA256 = 'edebe445c12a1f8f8f447ad9cf08c9ffb2587d0b453771b0701d0cb9856d1b4a'
+MUSIC_SIZE = 773773
+MUSIC_FILE = 'MEATCORES_MENU.mp3'
+
+class MenuMusic:
+    """Download and loop the tiny menu track without touching the UI thread."""
+    def __init__(self, cache):
+        self.cache = cache
+        self.path = cache/MUSIC_FILE
+        self.cancel = threading.Event()
+        self.ready = threading.Event()
+        self.lock = threading.Lock()
+        self.player = None
+        self.thread = None
+        # Development previews and catalogue tools must stay completely silent;
+        # MiSTer is the only target with the ALSA player used below.
+        if os.uname().machine != 'armv7l' or shutil.which('mpg123') is None:
+            return
+        self.thread = threading.Thread(target=self._run, name='meatcores-music', daemon=True)
+        self.thread.start()
+
+    def _valid(self):
+        try:
+            return (self.path.is_file() and self.path.stat().st_size == MUSIC_SIZE and
+                    hashlib.sha256(self.path.read_bytes()).hexdigest() == MUSIC_SHA256)
+        except OSError:
+            return False
+
+    def _download(self):
+        data = bytearray()
+        try:
+            with request(MUSIC_URL) as response:
+                while True:
+                    if self.cancel.is_set(): return False
+                    block = response.read(65536)
+                    if not block: break
+                    data.extend(block)
+                    if len(data) > MUSIC_SIZE: return False
+            if len(data) != MUSIC_SIZE or hashlib.sha256(data).hexdigest() != MUSIC_SHA256:
+                return False
+            if self.cancel.is_set(): return False
+            fd, name = tempfile.mkstemp(prefix='.meatcores-music-', dir=self.cache)
+            temporary = pathlib.Path(name)
+            try:
+                with os.fdopen(fd, 'wb') as output:
+                    output.write(data); output.flush(); os.fsync(output.fileno())
+                if self.cancel.is_set(): return False
+                os.replace(temporary, self.path)
+                temporary = None
+                return True
+            finally:
+                if temporary is not None and temporary.exists(): temporary.unlink()
+        except (OSError, IOError, ValueError):
+            return False
+
+    def _play_loop(self):
+        with self.lock:
+            if self.cancel.is_set(): return
+            try:
+                player = subprocess.Popen(
+                    ['mpg123', '-q', '--loop', '-1', str(self.path)], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    close_fds=True, start_new_session=True)
+            except OSError:
+                return
+            self.player = player
+        # mpg123 owns the loop; this watcher only waits cheaply for exit/cancel.
+        while not self.cancel.wait(.20):
+            if player.poll() is not None:
+                with self.lock:
+                    if self.player is player: self.player = None
+                return
+        self._stop_player()
+
+    def _run(self):
+        if not self._valid() and not self._download(): return
+        if self._valid() and self.ready.wait(): self._play_loop()
+
+    def begin(self):
+        """Allow playback once the first menu frame is visible."""
+        self.ready.set()
+
+    def _stop_player(self):
+        with self.lock:
+            player, self.player = self.player, None
+        if player is None: return
+        try:
+            if player.poll() is None: player.terminate()
+            player.wait(timeout=.75)
+        except (OSError, subprocess.TimeoutExpired):
+            try: player.kill(); player.wait(timeout=.25)
+            except (OSError, subprocess.TimeoutExpired): pass
+
+    def close(self):
+        self.cancel.set()
+        self.ready.set()
+        self._stop_player()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        self._stop_player()
 
 class RomSearch(list):
     def __init__(self, names, crcs):
@@ -1084,7 +1192,7 @@ def run_ui(root):
     lock = open(cache/'lock','w')
     try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError: raise RuntimeError('MEATCORES is already running')
-    display, inputs, worker = None, None, None
+    display, inputs, worker, music = None, None, None, None
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     def startup():
         db,online,message=load_db(cache)
@@ -1093,11 +1201,16 @@ def run_ui(root):
         lib.scan(ui.progress,cancel)
         return lib,online,message
     try:
+        # Start the tiny music fetch while the catalogue and 240p core load.
+        # It never shares the renderer or catalogue worker, so input/frame timing
+        # stays unchanged even on a first run with an empty cache.
+        music = MenuMusic(cache)
         worker=pool.submit(startup)
         sync_menu_maps(root)
         display=Display(cache)
         display.present(ui.render())
         inputs=InputPump(Inputs(display))
+        music.begin()
         operation='startup'; last=None; last_signature=None; next_tick=0
         while True:
             if worker is not None and worker.done():
@@ -1137,6 +1250,7 @@ def run_ui(root):
     finally:
         cancel.set()
         if inputs: inputs.close()
+        if music: music.close()
         if display: display.close()
         # Restore the user's video/input immediately even if a socket is timing out.
         pool.shutdown(wait=True)
