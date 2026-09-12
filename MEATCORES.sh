@@ -23,7 +23,7 @@ exec python3 - "$@" <<'MEATCORES_PY'
 import argparse, base64, collections, concurrent.futures, ctypes, fcntl
 import hashlib, io, json, mmap, os, pathlib, re, shutil, signal
 import struct, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request
-import zipfile, zlib
+import zipfile, zlib, subprocess, select
 import xml.etree.ElementTree as ET
 
 DB_URL = 'https://raw.githubusercontent.com/meathax/meatcores/db/db.json.zip'
@@ -123,9 +123,152 @@ def core_date(path):
     match = re.search(r'_(\d{8})\.rbf$', path, re.I)
     return match.group(1) if match else ''
 
-# Future CHD support: user-selected sources (not downloaded by this version).
-# https://archive.org/download/mame-chd-collection_01
-# https://archive.org/download/mame-chd-collection_02
+# Explicit per-set disk requirements. Do not infer disk format from a game name.
+# Example when adding a disk-backed core (use its documented output filename):
+# 'setname': [{'chd': 'setname/disk.chd', 'output': 'disk.vhd', 'format': 'vhd'}]
+# format='vhd' means the raw hard-disk image used by MiSTer, not a Microsoft
+# dynamic VHD container. format='chd' installs the compressed image unchanged.
+# The Downloader DB may also provide this mapping under 'meatcores_disks'.
+DISK_REQUIREMENTS = {}
+CHD_ITEMS = ('mame-chd-collection_01', 'mame-chd-collection_02')
+CHDMAN_URL = ('https://raw.githubusercontent.com/emmercm/chdman-js/'
+              'b0b3337cfd8a784f7e72a2a38a70b07cabeb2425/'
+              'packages/chdman-linux-arm/chdman-armv7')
+CHDMAN_SHA256 = 'da0ce2f11199823b090f81e52513cf78be22158d4210fa79bc34e8ec4a9386e5'
+CHDMAN_SIZE = 1239452
+
+def disk_specs(data, mapping=None):
+    setname = (ET.fromstring(data).findtext('setname') or '').strip()
+    specs = (DISK_REQUIREMENTS if mapping is None else mapping).get(setname, [])
+    for spec in specs:
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', setname):
+            raise ValueError('Unsafe disk set name')
+        name = spec['output']
+        if not re.fullmatch(r'[A-Za-z0-9_. -]+', name) or '..' in name:
+            raise ValueError('Unsafe disk output filename')
+        if spec['format'] not in ('chd', 'vhd'):
+            raise ValueError('Unsupported disk output format')
+        source = pathlib.PurePosixPath(spec['chd'])
+        if source.is_absolute() or '..' in source.parts or len(source.parts) != 2 or source.suffix != '.chd':
+            raise ValueError('Unsafe CHD source path')
+    return [(setname, dict(spec)) for spec in specs]
+
+def prepare_disks(library, declarations, folder, progress, cancel):
+    needed = []
+    for g in library.games:
+        for p in list(g['files']):
+            for setname, spec in declarations.get(p, []):
+                target = folder+'/chd/'+setname+'/'+spec['output']
+                if not safe_path(library.root, target).is_file():
+                    needed.append((g, target, spec))
+    if not needed: return
+    progress('READING CHD ARCHIVE INDEXES')
+    def index(item):
+        if cancel is not None and cancel.is_set(): raise Cancelled()
+        with request('https://archive.org/metadata/'+item) as response:
+            raw = response.read(16*1024*1024+1)
+        if len(raw) > 16*1024*1024: raise RuntimeError('CHD index too large')
+        return {f['name'][len('MAME CHDs (merged)/'):]: dict(f, item=item)
+                for f in json.loads(raw)['files'] if f.get('name', '').startswith('MAME CHDs (merged)/')
+                and f['name'].endswith('.chd') and not f.get('private')}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        indexes = list(pool.map(index, CHD_ITEMS))
+    for g, target, spec in needed:
+        entry = next((idx[spec['chd']] for idx in indexes if spec['chd'] in idx), None)
+        if entry is None:
+            g['rom_error'] = 'CHD unavailable: '+spec['chd']
+            continue
+        meta = {'disk': spec, 'size': int(entry['size']), 'hash': entry['md5'].zfill(32),
+                'overwrite': False, 'url': 'https://archive.org/download/'+entry['item']+'/'+
+                urllib.parse.quote(entry['name'], safe='/')}
+        if target in library.db['files'] and library.db['files'][target] != meta:
+            raise ValueError('Conflicting disk requirements: '+target)
+        library.db['files'][target] = meta
+        if target not in g['files']: g['files'].append(target)
+
+def chdman(stage, cancel):
+    tool = stage/'chdman'
+    if tool.is_file():
+        if tool.stat().st_size == CHDMAN_SIZE and hashlib.sha256(tool.read_bytes()).hexdigest() == CHDMAN_SHA256:
+            return tool
+        tool.unlink()
+    with request(CHDMAN_URL) as response, open(tool, 'wb') as out:
+        h, size = hashlib.sha256(), 0
+        while True:
+            if cancel.is_set(): raise Cancelled()
+            block = response.read(65536)
+            if not block: break
+            size += len(block)
+            if size > CHDMAN_SIZE: raise RuntimeError('Invalid chdman size')
+            h.update(block); out.write(block)
+    if size != CHDMAN_SIZE or h.hexdigest() != CHDMAN_SHA256:
+        raise RuntimeError('chdman checksum failed')
+    tool.chmod(0o755)
+    return tool
+
+def run_chdman(tool, args, cancel, progress, label):
+    proc = subprocess.Popen([str(tool)]+args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            env=dict(os.environ, LC_ALL='C'))
+    output, fraction = '', 0.0
+    try:
+        progress(label, 0)
+        while True:
+            if cancel.is_set(): raise Cancelled()
+            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if ready:
+                data = os.read(proc.stdout.fileno(), 4096)
+                if data:
+                    output = (output + data.decode('utf-8', 'replace'))[-8192:]
+                    matches = re.findall(r'([0-9]+(?:[.][0-9]+)?)%', output)
+                    if matches: fraction = min(1.0, float(matches[-1])/100)
+                    progress(label, fraction)
+                elif proc.poll() is not None: break
+            elif proc.poll() is not None: break
+        if proc.wait() != 0: raise RuntimeError(label+' failed: '+output[-400:])
+        progress(label, 1)
+        return output
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc.wait()
+        proc.stdout.close()
+
+def extract_disk(dest, meta, stage, cancel, progress):
+    if meta['disk']['format'] == 'chd': return
+    # Downloaded CHDs and chdman share the same private transaction directory.
+    source = stage/('disk-'+hashlib.sha256(str(dest).encode()).hexdigest()[:16]+'.chd')
+    os.replace(dest, source)
+    with source.open('rb') as f: header = f.read(124)
+    if len(header) != 124 or header[:8] != b'MComprHD' or struct.unpack('>II', header[8:16]) != (124,5):
+        raise RuntimeError('VHD extraction requires a version 5 CHD')
+    if any(header[104:124]): raise RuntimeError('Parent-dependent CHD needs an explicit parent mapping')
+    logical = struct.unpack('>Q', header[32:40])[0]
+    expected = header[64:84].hex()
+    if not logical or not any(header[64:84]): raise RuntimeError('CHD lacks a verified raw disk checksum')
+    if shutil.disk_usage(stage).free < logical + 4*1024*1024:
+        raise RuntimeError('Not enough space for extracted VHD (%d bytes)' % logical)
+    tool = chdman(stage, cancel)
+    info = run_chdman(tool, ['info','-i',str(source)], cancel, progress, 'CHECKING DISK TYPE')
+    if 'GDDD' not in info: raise RuntimeError('CHD is not a hard disk; VHD extraction refused')
+    run_chdman(tool, ['extracthd','-i',str(source),'-o',str(dest)], cancel, progress,
+               'EXTRACTING VHD '+dest.name)
+    if not dest.is_file() or dest.stat().st_size != logical:
+        raise RuntimeError('Extracted VHD size mismatch')
+    h, count = hashlib.sha1(), 0
+    with dest.open('rb') as f:
+        while True:
+            if cancel.is_set(): raise Cancelled()
+            block = f.read(262144)
+            if not block: break
+            h.update(block); count += len(block)
+            progress('VERIFYING VHD '+dest.name, count/logical)
+    if h.hexdigest() != expected: raise RuntimeError('Extracted VHD SHA1 mismatch')
+    with dest.open('rb') as f: os.fsync(f.fileno())
+    # Keep source until the whole installation commits. The transaction's finally
+    # removes the downloaded CHD, helper and partial outputs on all exit paths.
+
 ROM_ITEM = 'https://archive.org/download/mame-roms-merged_/'
 ROM_METADATA = 'https://archive.org/metadata/mame-roms-merged_'
 
@@ -160,7 +303,8 @@ def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
                 raise RuntimeError('MRA verification failed: ' + p)
             cached.write_bytes(data)
             source = cached
-        return p, rom_names(source.read_bytes())
+        data = source.read_bytes()
+        return p, (rom_names(data), disk_specs(data, library.db.get('meatcores_disks')))
     progress('CHECKING ROM REQUIREMENTS')
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         requirements = dict(pool.map(read_mra, mras))
@@ -170,7 +314,7 @@ def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
     for g in library.games:
         g['rom_error'] = ''
         for p in list(g['files']):
-            for names in requirements.get(p, []):
+            for names in requirements.get(p, ([], []))[0]:
                 existing = [name for name in names if safe_path(library.root, folder+'/'+name).is_file()]
                 if len(existing) == len(names): continue
                 if lookup is None:
@@ -194,6 +338,8 @@ def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
                             'rom': True, 'overwrite': False}
                     library.db['files'][target] = meta
                     if target not in g['files']: g['files'].append(target)
+
+    prepare_disks(library, {p: pair[1] for p, pair in requirements.items()}, folder, progress, cancel)
 
 class Library:
     def __init__(self, db, root):
@@ -238,7 +384,7 @@ class Library:
             progress('VERIFYING FILES %d/%d' % (n + 1, len(paths)))
             target = safe_path(self.root, p)
             meta = self.db['files'][p]
-            state = 'CURRENT' if (target.is_file() if meta.get('rom') else verified(target, meta, cancel)) else ('REPAIR' if target.exists() else 'NEW')
+            state = 'CURRENT' if (target.is_file() if (meta.get('rom') or meta.get('disk')) else verified(target, meta, cancel)) else ('REPAIR' if target.exists() else 'NEW')
             if p.lower().endswith('.rbf'):
                 date = core_date(p)
                 if target.parent not in version_index:
@@ -299,7 +445,7 @@ def install(library, cancel, progress):
         if library.games[i].get('rom_error'):
             raise RuntimeError(library.games[i]['rom_error'])
     paths = [p for p in library.plan()
-             if not (library.db['files'][p].get('rom') and safe_path(library.root, p).is_file())]
+             if not ((library.db['files'][p].get('rom') or library.db['files'][p].get('disk')) and safe_path(library.root, p).is_file())]
     if not paths:
         return 0
     total = sum(library.db['files'][p]['size'] for p in paths)
@@ -351,6 +497,8 @@ def install(library, cancel, progress):
                         raise Cancelled()
             if error:
                 raise error
+            if meta.get('disk'):
+                extract_disk(dest, meta, stage, cancel, progress)
             completed += meta['size']
         if cancel.is_set():
             raise Cancelled()
@@ -360,7 +508,7 @@ def install(library, cancel, progress):
             for index, p in enumerate(paths):
                 dest = safe_path(library.root, p)
                 meta = library.db['files'][p]
-                if (dest.is_file() if meta.get('rom') else verified(dest, meta)):
+                if (dest.is_file() if (meta.get('rom') or meta.get('disk')) else verified(dest, meta)):
                     continue
                 if dest.exists() and not meta.get('overwrite', True):
                     raise RuntimeError('Database protects existing file: ' + p)
@@ -475,8 +623,12 @@ class UI:
             c.text(22,77,'WORKING' + '.' * (self.tick % 4),CYAN)
             for row in range(5):
                 c.text(22,96+row*11,self.message[row*45:(row+1)*45],TEXT,270)
+            fraction = min(1.0, max(0.0, self.fraction))
+            c.text(22,153,'['+'#'*int(fraction*28)+'-'*(28-int(fraction*28))+']',CYAN,230)
+            c.text(268,153,'%3d%%' % int(fraction*100),TEXT,30)
             c.box(22,167,276,8,BG)
-            c.box(22,167,max(3,int(276*self.fraction)),8,CYAN)
+            for segment in range(int(fraction*46)):
+                c.box(22+segment*6,167,5,8,CYAN)
             c.text(22,181,'B/ESC CANCEL AND EXIT',MUTED,276)
         elif self.lib is None:
             c.text(12,76,'ACTION FAILED',AMBER)
