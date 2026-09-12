@@ -27,7 +27,7 @@ import zipfile, zlib, subprocess, select, queue
 import xml.etree.ElementTree as ET
 
 # Increment for each published script release. Development modes never self-update.
-SCRIPT_VERSION = 2026091203
+SCRIPT_VERSION = 2026091204
 SELF_TREE_URL = 'https://api.github.com/repos/meathax/meatscript/git/trees/main'
 SELF_RAW_URL = 'https://raw.githubusercontent.com/meathax/meatscript/main/MEATCORES.sh'
 
@@ -331,6 +331,11 @@ def extract_disk(dest, meta, stage, cancel, progress):
 ROM_ITEM = 'https://archive.org/download/mame-roms-merged_/'
 ROM_METADATA = 'https://archive.org/metadata/mame-roms-merged_'
 
+class RomSearch(list):
+    def __init__(self, names, crcs):
+        super().__init__(names)
+        self.crcs = crcs
+
 def rom_names(data):
     tree = ET.fromstring(data)
     result = []
@@ -342,8 +347,53 @@ def rom_names(data):
             if not re.fullmatch(r'[A-Za-z0-9_.-]+\.zip', name) or '..' in name:
                 raise ValueError('Unsafe MRA ROM filename: ' + name)
             names.append(name)
-        if names: result.append(names)
+        if names:
+            crcs = {int(part.get('crc'),16) for part in rom.iter('part')
+                    if re.fullmatch(r'[0-9a-fA-F]{8}',part.get('crc',''))}
+            result.append(RomSearch(names,crcs))
     return result
+
+def rom_present(root, folder, names):
+    existing = []
+    for name in names:
+        path = safe_path(root,folder+'/'+name)
+        if path.is_file(): existing.append(path)
+    if not existing: return False
+    if len(existing)==len(names) or not getattr(names,'crcs',None): return True
+    # Check only ZIP directory CRCs (no decompression): a merged parent can
+    # satisfy a missing clone ZIP, but a clone-only ZIP may still need its parent.
+    available = set()
+    for path in existing:
+        try:
+            with zipfile.ZipFile(path) as archive: available.update(info.CRC for info in archive.infolist())
+        except (OSError,zipfile.BadZipFile): continue
+    return names.crcs <= available
+
+def resolve_roms(library, progress, cancel):
+    pending = [(g, names) for i in library.selected if library.eligible(i)
+               for g in [library.games[i]] for names in g.get('rom_groups', [])
+               if not rom_present(library.root, library.rom_folder, names)]
+    if not pending: return
+    progress('READING ROM DOWNLOAD INDEX', 0)
+    if cancel.is_set(): raise Cancelled()
+    with request(ROM_METADATA) as response:
+        raw = response.read(32*1024*1024+1)
+    if len(raw)>32*1024*1024: raise RuntimeError('ROM index too large')
+    lookup = {pathlib.PurePosixPath(f['name']).name:f for f in json.loads(raw)['files']
+              if f.get('name','').startswith('MAME ROMs (merged)/')
+              and f['name'].endswith('.zip') and not f.get('private')}
+    for g,names in pending:
+        if cancel.is_set(): raise Cancelled()
+        available = [name for name in names if name in lookup]
+        if not available: raise RuntimeError('ROM unavailable in Archive: '+'|'.join(names))
+        for name in available:
+            target = library.rom_folder+'/'+name
+            if safe_path(library.root,target).is_file(): continue
+            entry = lookup[name]
+            library.db['files'][target] = {'size':int(entry['size']),'hash':entry['md5'].zfill(32),
+                'url':ROM_ITEM+urllib.parse.quote(entry['name'],safe='/'),'rom':True,'overwrite':False}
+            library.states[target]='NEW'
+            if target not in g['files']: g['files'].append(target)
 
 def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
     # Cache MRA descriptions by DB hash; never trust an obsolete local MRA.
@@ -354,49 +404,33 @@ def prepare_roms(library, cache, progress=lambda s: None, cancel=None):
         meta = library.db['files'][p]
         local = safe_path(library.root, p)
         cached = cache / (meta['hash'] + '.mra')
-        source = local if verified(local, meta, cancel) else cached
-        if not verified(source, meta, cancel):
+        data = None
+        for source in (local,cached):
+            try: candidate = source.read_bytes()
+            except OSError: continue
+            if len(candidate)==meta['size'] and hashlib.md5(candidate).hexdigest()==meta['hash']:
+                data = candidate; break
+        if data is None:
             with request(url_for(library.db, p)) as response:
-                data = response.read(meta['size'] + 1)
-            if len(data) != meta['size'] or hashlib.md5(data).hexdigest() != meta['hash']:
-                raise RuntimeError('MRA verification failed: ' + p)
+                data = response.read(meta['size']+1)
+            if len(data)!=meta['size'] or hashlib.md5(data).hexdigest()!=meta['hash']:
+                raise RuntimeError('MRA verification failed: '+p)
             cached.write_bytes(data)
-            source = cached
-        data = source.read_bytes()
         return p, (rom_names(data), disk_specs(data, library.db.get('meatcores_disks')))
     progress('CHECKING ROM REQUIREMENTS')
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         requirements = dict(pool.map(read_mra, mras))
     # FAT is case insensitive; preserve the existing spelling for other filesystems.
     folder = 'games/MAME' if (library.root/'games/MAME').is_dir() else 'games/mame'
-    lookup = None
+    library.rom_folder = folder
     for g in library.games:
         g['rom_error'] = ''
-        for p in list(g['files']):
+        groups = {}
+        for p in g['files']:
             for names in requirements.get(p, ([], []))[0]:
-                existing = [name for name in names if safe_path(library.root, folder+'/'+name).is_file()]
-                if len(existing) == len(names): continue
-                if lookup is None:
-                    progress('READING ARCHIVE ROM INDEX')
-                    with request(ROM_METADATA) as response:
-                        raw = response.read(32 * 1024 * 1024 + 1)
-                    if len(raw) > 32 * 1024 * 1024: raise RuntimeError('ROM index too large')
-                    lookup = {pathlib.PurePosixPath(f['name']).name: f for f in json.loads(raw)['files']
-                              if f.get('name', '').startswith('MAME ROMs (merged)/')
-                              and f['name'].endswith('.zip') and not f.get('private')}
-                available = [name for name in names if name in lookup]
-                # Merged archives store clones inside their parent ZIP.
-                if not available and not existing:
-                    g['rom_error'] = 'ROM unavailable in Archive: ' + '|'.join(names)
-                for name in available:
-                    target = folder+'/'+name
-                    if safe_path(library.root, target).is_file(): continue
-                    entry = lookup[name]
-                    meta = {'size': int(entry['size']), 'hash': entry['md5'].zfill(32),
-                            'url': ROM_ITEM + urllib.parse.quote(entry['name'], safe='/'),
-                            'rom': True, 'overwrite': False}
-                    library.db['files'][target] = meta
-                    if target not in g['files']: g['files'].append(target)
+                group = groups.setdefault(tuple(names),RomSearch(names,set()))
+                group.crcs.update(names.crcs)
+        g['rom_groups'] = list(groups.values())
 
     prepare_disks(library, {p: pair[1] for p, pair in requirements.items()}, folder, progress, cancel)
 
@@ -411,6 +445,9 @@ class Library:
         primaries = [p for p in files if p.lower().endswith('.mra') and '/_alternatives/' not in p]
         alts = [p for p in files if '/_alternatives/' in p and p.lower().endswith('.mra')]
         owned_alts = set()
+        alternatives_by_game = collections.defaultdict(list)
+        for alt in alts:
+            alternatives_by_game[slug(pathlib.PurePosixPath(alt).parent.name)].append(alt)
         for p in primaries:
             tags = set(files[p].get('tags', [])) & tag_ids
             cores = [r for r in rbfs if tags & set(files[r].get('tags', []))]
@@ -418,7 +455,7 @@ class Library:
                 raise ValueError('Cannot unambiguously link MRA to RBF: ' + p)
             core = cores[0]
             name = pathlib.PurePosixPath(p).stem
-            variants = [a for a in alts if slug(pathlib.PurePosixPath(a).parent.name) == slug(name)]
+            variants = alternatives_by_game.get(slug(name), [])
             owned_alts.update(variants)
             assets = [a for a in files if not a.lower().endswith(('.mra', '.rbf'))
                       and tags & set(files[a].get('tags', []))]
@@ -436,7 +473,12 @@ class Library:
             self.groups.setdefault(g['system'], []).append(i)
 
     def scan(self, progress=lambda s: None, cancel=None):
-        states, version_index = {}, {}
+        states, version_index, rom_checks = {}, {}, {}
+        def missing_rom(names):
+            key = (tuple(names),frozenset(names.crcs))
+            if key not in rom_checks:
+                rom_checks[key] = not rom_present(self.root,self.rom_folder,names)
+            return rom_checks[key]
         paths = sorted({p for g in self.games for p in g['files']})
         for n, p in enumerate(paths):
             if cancel is not None and cancel.is_set(): raise Cancelled()
@@ -460,10 +502,12 @@ class Library:
             states[p] = state
         for g in self.games:
             current = [states[p] for p in g['files']]
+            if g.get('rom_groups'):
+                g['rom_missing'] = any(missing_rom(names) for names in g['rom_groups'])
             g['installed'] = safe_path(self.root, g['mra']).is_file()
             if 'LOCAL NEWER' in current:
                 g['state'] = 'LOCAL NEWER'
-            elif all(s == 'CURRENT' for s in current) and not g.get('rom_error'):
+            elif all(s == 'CURRENT' for s in current) and not g.get('rom_error') and not g.get('rom_missing'):
                 g['state'] = 'CURRENT'
             elif 'UPDATE' in current and g['installed']:
                 g['state'] = 'UPDATE'
@@ -500,6 +544,7 @@ class Cancelled(Exception):
     pass
 
 def install(library, cancel, progress):
+    resolve_roms(library, progress, cancel)
     for i in library.selected:
         if library.games[i].get('rom_error'):
             raise RuntimeError(library.games[i]['rom_error'])
@@ -694,7 +739,7 @@ class Canvas:
 class UI:
     def __init__(self):
         self.lib, self.online, self.busy = None, False, True
-        self.message, self.fraction, self.focus = 'CONNECTING TO MEATCORES...', 0, 0
+        self.message, self.fraction, self.focus = 'CHECKING INSTALLED FILES', 0, 0
         self.first, self.rows, self.error, self.tick = 0, [], '', 0
 
     def set_library(self, lib, online, message):
@@ -737,8 +782,8 @@ class UI:
             list_focus = self.focus - 3
             if 0 <= list_focus < len(self.rows):
                 if list_focus < self.first: self.first = list_focus
-                if list_focus >= self.first+9: self.first = list_focus-8
-            for row,item in enumerate(self.rows[self.first:self.first+9]):
+                if list_focus >= self.first+10: self.first = list_focus-9
+            for row,item in enumerate(self.rows[self.first:self.first+10]):
                 kind,name,ids = item
                 eligible = {i for i in ids if self.lib.eligible(i)}
                 chosen = self.lib.selected & eligible
@@ -750,9 +795,10 @@ class UI:
                 if 'PROTECTED' in states: badge = '#'
                 active = self.focus == 3 + self.first + row
                 y = 76 + row*11
-                if active: c.box(12,y-2,290,11,CYAN)
-                color = INK if active else (MUTED if current else (CYAN if kind=='group' else TEXT))
-                prefix = ' ' if kind=='game' and len(self.lib.groups[self.lib.games[ids[0]]['system']])>1 else ''
+                if active or kind=='group': c.box(12,y-2,290,11,CYAN if active else PANEL)
+                color = INK if active else (MUTED if current else (AMBER if kind=='group' else TEXT))
+                prefix = '   ' if kind=='game' and len(self.lib.groups[self.lib.games[ids[0]]['system']])>1 else ''
+                prefix = ' SYSTEM: ' if kind=='group' else prefix
                 display = name
                 room = 36-len(prefix)
                 if len(display)>room:
@@ -761,23 +807,14 @@ class UI:
                     display = display[offset:offset+room]
                 c.label(14,y,mark+prefix+' '+display,color,270)
                 c.label(289,y,badge,INK if active else (AMBER if badge in ('!','~') else MUTED),8)
-            c.box(305,76,2,96,PANEL)
-            c.box(305,76+int(85*self.first/max(1,len(self.rows)-9)),2,11,CYAN)
+            c.box(305,76,2,110,PANEL)
+            c.box(305,76+int(99*self.first/max(1,len(self.rows)-10)),2,11,CYAN)
             count = len(self.lib.selected)
-            c.label(12,179,'%02d SELECTED' % count,CYAN,100)
-            if 0 <= list_focus < len(self.rows):
-                ids = self.rows[list_focus][2]
-                state = self.lib.games[ids[0]]['state'] if len(ids)==1 else '%d GAMES' % len(ids)
-                date = self.lib.games[ids[0]]['date']
-                if date: state += ' ' + date[:4]+'-'+date[4:6]+'-'+date[6:]
-            else:
-                state = 'LIVE DB' if self.online else 'OFFLINE'
-            if not self.online: state = 'OFFLINE / READ ONLY'
-            c.label(150,179,state,AMBER,155)
-            for i,(x,w,label) in enumerate([(12,218,'DOWNLOAD SELECTED'),(234,74,'EXIT')]):
-                active = self.focus == len(self.rows)+3+i
-                c.box(x,191,w,15,CYAN if active else PANEL)
-                c.label(x+6,195,label,INK if active else TEXT,w-10)
+            c.label(12,195,'%02d SELECTED' % count,CYAN,110)
+            updates = len({g['core'] for g in self.lib.games
+                           if self.lib.states.get(g['core']) in ('NEW','UPDATE')})
+            state = 'NEW UPDATES %d' % updates if self.online else 'OFFLINE / READ ONLY'
+            c.label(150,195,state,AMBER,155)
         c.box(12,212,296,1,PANEL)
         c.label(12,217,'A/ENTER SELECT   B/ESC BACK',TEXT)
         c.label(12,227,'X/SHIFT DOWNLOAD   UP/DOWN MOVE',CYAN)
@@ -786,7 +823,7 @@ class UI:
     def action(self, action):
         if action == 'back': return 'exit'
         if self.busy or self.lib is None: return None
-        n = len(self.rows)+5
+        n = len(self.rows)+3
         if action in ('up','down','left','right'):
             self.focus = (self.focus + (-1 if action in ('up','left') else 1)) % n
             self.tick = 0
@@ -796,13 +833,10 @@ class UI:
         elif action == 'download':
             if self.online and self.lib.selected: return 'download'
         elif action == 'select':
-            if self.focus==n-1: return 'exit'
             if not self.online: return None
             if self.focus==0: self.lib.updates()
             elif self.focus==1: self.lib.selected = {i for i in range(len(self.lib.games)) if self.lib.eligible(i)}
             elif self.focus==2: self.lib.selected.clear()
-            elif self.focus==n-2:
-                if self.lib.selected: return 'download'
             else: self.lib.choose(self.rows[self.focus-3][2])
         return None
 
@@ -852,7 +886,7 @@ class Display:
             self.loaded = True
             deadline = time.monotonic()+8
             while time.monotonic()<deadline:
-                time.sleep(.05)
+                time.sleep(.005)
                 if pathlib.Path('/tmp/CORENAME').read_text().strip() == 'MEATCORES': break
             else: raise RuntimeError('Display core did not start')
             self.fd = os.open('/dev/mem',os.O_RDWR|os.O_SYNC)
@@ -1038,7 +1072,6 @@ def run_ui(root):
         return lib,online,message
     try:
         worker=pool.submit(startup)
-        print('MEATCORES: starting native 320x240 display...',flush=True)
         sync_menu_maps(root)
         display=Display(cache)
         display.present(ui.render())
@@ -1050,7 +1083,7 @@ def run_ui(root):
                     result=worker.result()
                     if operation=='startup': ui.set_library(*result)
                     else:
-                        ui.busy=False; ui.message='DONE: %d FILES VERIFIED'%result
+                        break  # Verified installation finished; return to MiSTer immediately.
                 except Cancelled:
                     ui.busy=False
                 except Exception as exc:
@@ -1068,7 +1101,6 @@ def run_ui(root):
                     ui.busy=True; ui.fraction=0
                     def download():
                         count=install(ui.lib,cancel,ui.progress)
-                        ui.lib.scan(ui.progress,cancel)
                         return count
                     operation='download'; worker=pool.submit(download)
             if time.monotonic()>=next_tick:
