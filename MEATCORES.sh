@@ -27,7 +27,7 @@ import zipfile, zlib, subprocess, select
 import xml.etree.ElementTree as ET
 
 # Increment for each published script release. Development modes never self-update.
-SCRIPT_VERSION = 2026091201
+SCRIPT_VERSION = 2026091202
 SELF_TREE_URL = 'https://api.github.com/repos/meathax/meatscript/git/trees/main'
 SELF_RAW_URL = 'https://raw.githubusercontent.com/meathax/meatscript/main/MEATCORES.sh'
 
@@ -674,9 +674,6 @@ class UI:
         c.box(0,0,320,240,BG)
         c.box(12,12,296,2,CYAN)
         c.text(12,21,'MEATCORES',TEXT,240,2)
-        c.text(234,22,'FPGA',CYAN,70)
-        c.text(234,32,'[ DOS ]',MUTED,70)
-        c.text(12,42,'C:\\> =READY !UPDATE ~REPAIR +NEW',MUTED)
         if self.busy:
             c.box(12,64,296,129,PANEL)
             c.text(22,77,'WORKING' + '.' * (self.tick % 4),CYAN)
